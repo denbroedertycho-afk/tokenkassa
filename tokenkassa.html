@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tokenkassa</title>
+<style>
+:root{--bg:#11281b;--panel:#1b3a28;--ink:#f2f5ee;--mut:#9fb6a5;--accent:#f2b134;--ok:#6fd18a;--bad:#ff7a66;--line:#2f5640}
+body[data-mode="top"]{--bg:#10273a;--panel:#193a55;--accent:#5db7ff;--mut:#9db8cc;--line:#2c5878}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font-family:system-ui,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;gap:12px;padding:12px;padding-top:max(12px,env(safe-area-inset-top));padding-bottom:max(12px,env(safe-area-inset-bottom));max-width:560px;margin:0 auto}
+.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.tabs button{padding:14px;font-size:1.05rem;font-weight:700;border:2px solid var(--line);background:transparent;color:var(--mut);border-radius:12px}
+.tabs button[aria-selected="true"]{background:var(--accent);border-color:var(--accent);color:#10201a}
+.total{background:var(--panel);border-radius:18px;padding:16px 20px;text-align:center}
+.total small{display:block;color:var(--mut);font-size:1rem}
+.total b{font-size:clamp(4rem,22vw,7rem);line-height:1.05;color:var(--accent);font-variant-numeric:tabular-nums}
+.total span{font-size:1.2rem;color:var(--mut);margin-left:6px}
+.amounts{display:grid;grid-template-columns:1fr 1fr;gap:10px;flex:1;min-height:0}
+.amounts button{font-size:clamp(1.8rem,9vw,2.8rem);font-weight:800;border:0;border-radius:18px;background:var(--panel);color:var(--ink);border-bottom:6px solid var(--line)}
+.amounts button:active{transform:translateY(3px);border-bottom-width:3px}
+.amounts .wis{grid-column:1/-1;flex:none;font-size:1.3rem;padding:14px;background:transparent;border:2px solid var(--line);color:var(--mut)}
+#status{border-radius:14px;padding:14px 16px;font-size:1.15rem;font-weight:600;background:var(--panel);min-height:3.6em;display:flex;align-items:center}
+#status.ok{background:var(--ok);color:#0d2616}
+#status.bad{background:var(--bad);color:#2e0d07}
+#status.wait{background:var(--accent);color:#10201a}
+#start{padding:16px;font-size:1.2rem;font-weight:800;border:0;border-radius:14px;background:var(--ink);color:#10201a}
+button:focus-visible{outline:3px solid #fff;outline-offset:2px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body data-mode="pay">
+<div class="tabs" role="tablist">
+  <button id="tabPay" role="tab" aria-selected="true">Afrekenen</button>
+  <button id="tabTop" role="tab" aria-selected="false">Opwaarderen</button>
+</div>
+<div class="total"><small id="label">Totaal</small><b id="num">0</b><span>tokens</span></div>
+<div class="amounts" id="amounts"></div>
+<div id="status">Druk op Kaartlezer starten.</div>
+<button id="start">Kaartlezer starten</button>
+
+<script>
+/* Pas deze twee waarden aan voordat je de pagina gebruikt */
+const PIN = "1234";                    // pincode voor het tabblad Opwaarderen
+const SECRET = "verander-dit-geheim";  // geheim voor het controlegetal op de kaart
+
+/* Saldo wordt in halve tokens (hele getallen) op de kaart bewaard: 1 = 0,5 token */
+let mode = "pay", total = 0, busy = false, lastDone = 0, unlocked = false, reader = null;
+const $ = s => document.querySelector(s);
+const fmt = h => (h / 2).toString().replace(".", ",");
+
+function hash(s){let h=2166136261;for(const c of s){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}return (h>>>0).toString(36)}
+const sign = (uid,h) => hash(SECRET+"|"+uid+"|"+h);
+const encode = (uid,h) => "TK1:"+h+":"+sign(uid,h);
+function decode(uid,text){
+  const p = text.split(":");
+  if(p[0]!=="TK1"||p.length!==3) return null;
+  const h = parseInt(p[1],10);
+  if(!Number.isInteger(h)||h<0||p[2]!==sign(uid,h)) return null;
+  return h;
+}
+
+function say(msg,kind){const s=$("#status");s.textContent=msg;s.className=kind||""}
+function beep(ok){
+  try{const a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();
+    o.frequency.value=ok?880:220;o.connect(g);g.connect(a.destination);g.gain.value=.2;o.start();o.stop(a.currentTime+(ok?.15:.4));}catch(e){}
+  if(navigator.vibrate) navigator.vibrate(ok?80:[120,60,120]);
+}
+
+function render(){
+  document.body.dataset.mode = mode;
+  $("#tabPay").setAttribute("aria-selected", mode==="pay");
+  $("#tabTop").setAttribute("aria-selected", mode==="top");
+  $("#label").textContent = mode==="pay" ? "Totaal" : "Opwaarderen met";
+  $("#num").textContent = fmt(total);
+  const steps = mode==="pay" ? [[1,"+ 0,5"],[2,"+ 1"]] : [[1,"+ 0,5"],[2,"+ 1"],[10,"+ 5"],[20,"+ 10"]];
+  $("#amounts").innerHTML = steps.map(s=>`<button data-add="${s[0]}">${s[1]}</button>`).join("") + `<button class="wis" data-add="0">Wissen</button>`;
+}
+function ready(){
+  if(!reader) return;
+  say(mode==="pay"
+    ? (total>0 ? "Houd de kaart tegen de telefoon om af te rekenen." : "Kies een bedrag of houd een kaart tegen om het saldo te zien.")
+    : "Kies een bedrag en houd de kaart tegen de telefoon om op te waarderen.");
+}
+
+$("#amounts").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  const n=+b.dataset.add; total = n===0 ? 0 : total+n; render(); ready();
+});
+$("#tabPay").onclick = () => { mode="pay"; unlocked=false; total=0; render(); ready(); };
+$("#tabTop").onclick = () => {
+  if(!unlocked){
+    const p = prompt("Pincode voor opwaarderen:");
+    if(p!==PIN){ say("Pincode onjuist.","bad"); return; }
+    unlocked = true;
+  }
+  mode="top"; total=0; render(); ready();
+};
+
+async function start(){
+  if(!("NDEFReader" in window)){ say("Deze browser kan geen NFC. Gebruik Chrome op Android, via een https-adres.","bad"); return; }
+  try{
+    reader = new NDEFReader();
+    await reader.scan();
+    reader.onreading = onTag;
+    reader.onreadingerror = () => say("Kaart niet te lezen. Probeer opnieuw.","bad");
+    $("#start").hidden = true;
+    try{ if(navigator.wakeLock) await navigator.wakeLock.request("screen"); }catch(e){}
+    ready();
+  }catch(e){ say("NFC starten mislukt: "+e.message,"bad"); }
+}
+$("#start").onclick = start;
+
+function fail(msg){ say(msg,"bad"); beep(false); lastDone = Date.now(); }
+
+async function onTag(ev){
+  if(busy || Date.now()-lastDone<2500) return;
+  const uid = ev.serialNumber;
+  let text = null;
+  for(const r of ev.message.records){
+    if(r.recordType==="text"){ text = new TextDecoder(r.encoding||"utf-8").decode(r.data); break; }
+  }
+  const bal = text===null ? null : decode(uid,text);
+  if(text!==null && bal===null){ fail("Kaart ongeldig of aangepast."); return; }
+
+  if(total<=0){
+    say(bal===null ? "Kaart is nog leeg: 0 tokens." : "Saldo: "+fmt(bal)+" tokens.","ok"); lastDone=Date.now(); return;
+  }
+  let newBal;
+  if(mode==="pay"){
+    if(bal===null){ fail("Kaart is nog niet opgewaardeerd."); return; }
+    if(bal<total){ fail("Te weinig tokens. Saldo "+fmt(bal)+", nodig "+fmt(total)+"."); return; }
+    newBal = bal-total;
+  }else{
+    newBal = (bal||0)+total;
+  }
+  await commit(uid,newBal);
+}
+
+async function commit(uid,newBal){
+  busy = true;
+  say("Houd de kaart nog even tegen…","wait");
+  const ac = new AbortController(), t = setTimeout(()=>ac.abort(),6000);
+  try{
+    await reader.write({records:[{recordType:"text",data:encode(uid,newBal)}]},{signal:ac.signal});
+    const paid = mode==="pay";
+    say((paid?"Betaald. ":"Opgewaardeerd. ")+"Nieuw saldo: "+fmt(newBal)+" tokens.","ok");
+    beep(true);
+    total = 0;
+    if(!paid){ mode="pay"; unlocked=false; }
+    render();
+  }catch(e){
+    say("Schrijven mislukt. Houd de kaart opnieuw tegen: het saldo wordt dan opnieuw gecontroleerd.","bad");
+    beep(false);
+  }finally{
+    clearTimeout(t); busy=false; lastDone=Date.now();
+  }
+}
+render();
+</script>
+</body>
+</html>
